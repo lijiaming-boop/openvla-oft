@@ -91,6 +91,7 @@ class PrismaticVisionBackbone(nn.Module):
         super().__init__()
         self.use_fused_vision_backbone = use_fused_vision_backbone
         self.num_images_in_input = 1  # Default value, can be overridden later
+        self.wrist_image_weight = 1.0  # Feature scale for non-primary images; 1.0 preserves checkpoint behavior
 
         # Validate number of (fused) vision backbones
         if len(timm_model_ids) > 2:
@@ -183,6 +184,12 @@ class PrismaticVisionBackbone(nn.Module):
         """
         self.num_images_in_input = num_images_in_input
 
+    def set_wrist_image_weight(self, weight: float) -> None:
+        """Scale patch features from every non-primary (wrist) image."""
+        if weight <= 0:
+            raise ValueError(f"wrist image weight must be positive, got {weight}")
+        self.wrist_image_weight = float(weight)
+
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """
         Implements the forward pass for the vision backbone.
@@ -211,7 +218,7 @@ class PrismaticVisionBackbone(nn.Module):
 
             # Process each image and collect patches
             all_patches = []
-            for img in images:
+            for image_idx, img in enumerate(images):
                 # Split each image further into two stacks of channels (each with 3 channels)
                 img_regular, img_fused = torch.split(img, [3, 3], dim=1)
 
@@ -221,6 +228,8 @@ class PrismaticVisionBackbone(nn.Module):
 
                 # Concatenate SigLIP and DINOv2 patches along the hidden dimension
                 combined_patches = torch.cat([patches, patches_fused], dim=2)
+                if image_idx > 0:
+                    combined_patches = combined_patches * self.wrist_image_weight
                 all_patches.append(combined_patches)
 
             # Concatenate all patches along the patch dimension

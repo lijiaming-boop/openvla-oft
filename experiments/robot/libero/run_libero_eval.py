@@ -98,6 +98,7 @@ class GenerateConfig:
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
+    wrist_image_weight: float = 1.0                  # Scale wrist-camera patch features (1.0 keeps baseline behavior)
 
     lora_rank: int = 32                              # Rank of LoRA weight matrix (MAKE SURE THIS MATCHES TRAINING!)
 
@@ -114,6 +115,9 @@ class GenerateConfig:
     num_trials_per_task: int = 50                    # Number of rollouts per task
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
+    target_episodes: str = ""                        # Optional zero-based task:state pairs, e.g. "4:32,6:20,7:27"
+    dump_camera_inputs: bool = False                 # Save raw/resized/final camera inputs at every policy replan
+    camera_dump_dir: str = "./experiments/camera_dumps"  # Root directory for camera diagnostics
 
     #################################################################################################################
     # Utils
@@ -138,15 +142,48 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    assert 1 <= cfg.num_open_loop_steps <= NUM_ACTIONS_CHUNK, (
+        f"num_open_loop_steps must be in [1, {NUM_ACTIONS_CHUNK}], got {cfg.num_open_loop_steps}"
+    )
+    assert cfg.wrist_image_weight > 0, "wrist_image_weight must be positive!"
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+
+def parse_target_episodes(spec: str):
+    """Parse comma-separated zero-based task:state pairs while preserving requested order."""
+    if not spec.strip():
+        return None
+
+    targets = {}
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            task_id_text, episode_idx_text = item.split(":", maxsplit=1)
+            task_id, episode_idx = int(task_id_text), int(episode_idx_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid target_episodes item {item!r}; expected zero-based task:state, e.g. '4:32,6:20'"
+            ) from exc
+        if task_id < 0 or episode_idx < 0:
+            raise ValueError(f"target_episodes values must be non-negative, got {item!r}")
+        targets.setdefault(task_id, []).append(episode_idx)
+    return targets
 
 
 def initialize_model(cfg: GenerateConfig):
     """Initialize model and associated components."""
     # Load model
     model = get_model(cfg)
+
+    # Apply an explicit feature-scale ablation to non-primary (wrist) camera patch embeddings.
+    if hasattr(model.vision_backbone, "set_wrist_image_weight"):
+        model.vision_backbone.set_wrist_image_weight(cfg.wrist_image_weight)
+    elif cfg.wrist_image_weight != 1.0:
+        raise AttributeError("This vision backbone does not support wrist_image_weight")
 
     # Load proprio projector if needed
     proprio_projector = None
@@ -257,6 +294,10 @@ def prepare_observation(obs, resize_size):
         "state": np.concatenate(
             (obs["robot0_eef_pos"], quat2axisangle(obs["robot0_eef_quat"]), obs["robot0_gripper_qpos"])
         ),
+        "_camera_debug": {
+            "raw_full_image": img,
+            "raw_wrist_image": wrist_img,
+        },
     }
 
     return observation, img  # Return both processed observation and original image for replay
@@ -287,6 +328,8 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    task_id: int = -1,
+    episode_idx: int = -1,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -303,12 +346,15 @@ def run_episode(
         print(f"WARNING: cfg.num_open_loop_steps ({cfg.num_open_loop_steps}) does not match the NUM_ACTIONS_CHUNK "
               f"({NUM_ACTIONS_CHUNK}) constant defined in prismatic.vla.constants! For best performance (in terms of "
                "both speed and success rate), we recommend executing the full action chunk.")
-    action_queue = deque(maxlen=cfg.num_open_loop_steps)
+    # Keep an unbounded queue and explicitly enqueue the FIRST N actions below. Using
+    # deque(maxlen=N).extend(all_8_actions) would silently retain the LAST N actions.
+    action_queue = deque()
 
     # Setup
     t = 0
     replay_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    replan_idx = 0
 
     # Run episode
     success = False
@@ -326,6 +372,17 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                if cfg.dump_camera_inputs:
+                    dump_dir = Path(cfg.camera_dump_dir) / f"task_{task_id:02d}" / f"state_{episode_idx:02d}"
+                    observation["_camera_debug"].update(
+                        {
+                            "dump_dir": str(dump_dir),
+                            "prefix": f"replan_{replan_idx:03d}_step_{t - cfg.num_steps_wait:03d}",
+                            "task_description": task_description,
+                            "task_id": task_id,
+                            "episode_idx": episode_idx,
+                        }
+                    )
                 # Query model to get action
                 actions = get_action(
                     cfg,
@@ -338,7 +395,13 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
-                action_queue.extend(actions)
+                action_queue.extend(actions[: cfg.num_open_loop_steps])
+                log_message(
+                    f"Replan {replan_idx}: predicted {len(actions)} actions; "
+                    f"queued first {min(len(actions), cfg.num_open_loop_steps)}",
+                    log_file,
+                )
+                replan_idx += 1
 
             # Get action from queue
             action = action_queue.popleft()
@@ -372,6 +435,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    episode_indices=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -385,7 +449,13 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    if episode_indices is None:
+        episode_indices = list(range(cfg.num_trials_per_task))
+    for episode_idx in tqdm.tqdm(episode_indices):
+        if episode_idx >= len(initial_states):
+            raise IndexError(
+                f"Task {task_id} requested initial-state index {episode_idx}, but only {len(initial_states)} exist"
+            )
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -405,7 +475,11 @@ def run_task(
             # Get initial state
             initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        log_message(
+            f"Starting targeted task_id={task_id}, initial_state_index={episode_idx} "
+            f"(task trial {episode_idx + 1})...",
+            log_file,
+        )
 
         # Run episode
         success, replay_images = run_episode(
@@ -420,6 +494,8 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            task_id,
+            episode_idx,
         )
 
         # Update counters
@@ -480,12 +556,20 @@ def eval_libero(cfg: GenerateConfig) -> float:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
+    target_episodes = parse_target_episodes(cfg.target_episodes)
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+    log_message(f"Open-loop execution steps: {cfg.num_open_loop_steps}/{NUM_ACTIONS_CHUNK}", log_file)
+    log_message(f"Wrist image feature weight: {cfg.wrist_image_weight}", log_file)
+    log_message(f"Target episodes (zero-based task:state): {target_episodes or 'ALL'}", log_file)
+    log_message(f"Camera input dump: {cfg.dump_camera_inputs} -> {cfg.camera_dump_dir}", log_file)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    task_ids = list(target_episodes.keys()) if target_episodes is not None else list(range(num_tasks))
+    for task_id in tqdm.tqdm(task_ids):
+        if task_id >= num_tasks:
+            raise IndexError(f"Requested task_id {task_id}, but suite only has {num_tasks} tasks")
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,
@@ -499,6 +583,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            target_episodes[task_id] if target_episodes is not None else None,
         )
 
     # Calculate final success rate

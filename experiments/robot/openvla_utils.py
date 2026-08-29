@@ -712,6 +712,52 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def dump_vla_camera_inputs(
+    cfg: Any,
+    obs: Dict[str, Any],
+    processed_images: List[Image.Image],
+    pixel_values: torch.Tensor,
+    prompt: str,
+) -> None:
+    """Save the camera data visible at key boundaries of the VLA inference path."""
+    if not getattr(cfg, "dump_camera_inputs", False):
+        return
+    debug = obs.get("_camera_debug")
+    if not debug or "dump_dir" not in debug:
+        return
+
+    dump_dir = Path(debug["dump_dir"])
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    prefix = debug["prefix"]
+
+    Image.fromarray(debug["raw_full_image"]).convert("RGB").save(dump_dir / f"{prefix}_00_agent_raw.png")
+    Image.fromarray(debug["raw_wrist_image"]).convert("RGB").save(dump_dir / f"{prefix}_01_wrist_raw.png")
+    Image.fromarray(obs["full_image"]).convert("RGB").save(dump_dir / f"{prefix}_02_agent_resized.png")
+    Image.fromarray(obs["wrist_image"]).convert("RGB").save(dump_dir / f"{prefix}_03_wrist_resized.png")
+    processed_images[0].save(dump_dir / f"{prefix}_04_agent_model_input.png")
+    if len(processed_images) > 1:
+        processed_images[1].save(dump_dir / f"{prefix}_05_wrist_model_input.png")
+
+    pixel_values_float = pixel_values.detach().float().cpu()
+    metadata = {
+        "task_id": debug.get("task_id"),
+        "initial_state_index": debug.get("episode_idx"),
+        "task_description": debug.get("task_description"),
+        "prompt": prompt,
+        "wrist_image_weight": float(getattr(cfg, "wrist_image_weight", 1.0)),
+        "pixel_values_shape": list(pixel_values_float.shape),
+        "pixel_values_min": float(pixel_values_float.min()),
+        "pixel_values_max": float(pixel_values_float.max()),
+        "pixel_values_mean": float(pixel_values_float.mean()),
+        "raw_agent_shape": list(debug["raw_full_image"].shape),
+        "raw_wrist_shape": list(debug["raw_wrist_image"].shape),
+        "policy_agent_shape": list(obs["full_image"].shape),
+        "policy_wrist_shape": list(obs["wrist_image"].shape),
+    }
+    with open(dump_dir / f"{prefix}_06_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -749,6 +795,7 @@ def get_vla_action(
 
         # Process images
         all_images = prepare_images_for_vla(all_images, cfg)
+        processed_images_for_dump = list(all_images)
 
         # Extract primary image and additional images
         primary_image = all_images.pop(0)
@@ -768,6 +815,8 @@ def get_vla_action(
             primary_pixel_values = inputs["pixel_values"]
             all_wrist_pixel_values = [wrist_inputs["pixel_values"] for wrist_inputs in all_wrist_inputs]
             inputs["pixel_values"] = torch.cat([primary_pixel_values] + all_wrist_pixel_values, dim=1)
+
+        dump_vla_camera_inputs(cfg, obs, processed_images_for_dump, inputs["pixel_values"], prompt)
 
         # Process proprioception data if used
         proprio = None
