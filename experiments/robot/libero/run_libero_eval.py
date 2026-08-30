@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -67,6 +68,7 @@ TASK_MAX_STEPS = {
     TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
     TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
 }
+BASE_CONTROL_FREQ = 20
 
 
 # Set up logging
@@ -118,6 +120,10 @@ class GenerateConfig:
     target_episodes: str = ""                        # Optional zero-based task:state pairs, e.g. "4:32,6:20,7:27"
     dump_camera_inputs: bool = False                 # Save raw/resized/final camera inputs at every policy replan
     camera_dump_dir: str = "./experiments/camera_dumps"  # Root directory for camera diagnostics
+    dump_action_chunks: bool = False                 # Save each predicted 8x7 chunk and executed gripper commands
+    action_dump_dir: str = "./experiments/action_dumps"  # Root directory for action/simulator diagnostics
+    target_motion_replan_threshold_m: float = 0.0    # Privileged sim ablation; 0 disables target-motion replanning
+    control_freq: int = BASE_CONTROL_FREQ            # LIBERO controller frequency; baseline is 20 Hz
 
     #################################################################################################################
     # Utils
@@ -146,6 +152,8 @@ def validate_config(cfg: GenerateConfig) -> None:
         f"num_open_loop_steps must be in [1, {NUM_ACTIONS_CHUNK}], got {cfg.num_open_loop_steps}"
     )
     assert cfg.wrist_image_weight > 0, "wrist_image_weight must be positive!"
+    assert cfg.target_motion_replan_threshold_m >= 0, "target_motion_replan_threshold_m must be non-negative!"
+    assert cfg.control_freq > 0, "control_freq must be positive!"
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -172,6 +180,66 @@ def parse_target_episodes(spec: str):
             raise ValueError(f"target_episodes values must be non-negative, got {item!r}")
         targets.setdefault(task_id, []).append(episode_idx)
     return targets
+
+
+def append_jsonl(path: Path, payload) -> None:
+    """Append one JSON-serializable record and flush it for crash-safe diagnostics."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def collect_sim_snapshot(env):
+    """Collect privileged object poses and MuJoCo contacts for diagnosis only."""
+    wrapped_env = getattr(env, "env", env)
+    sim = getattr(wrapped_env, "sim", None)
+    snapshot = {"objects": {}, "contacts": []}
+    if sim is None:
+        return snapshot
+
+    for collection_name in ("objects_dict", "fixtures_dict"):
+        collection = getattr(wrapped_env, collection_name, {}) or {}
+        for object_name, obj in collection.items():
+            body_name = getattr(obj, "root_body", None)
+            if body_name is None:
+                continue
+            try:
+                body_id = sim.model.body_name2id(body_name)
+                snapshot["objects"][str(object_name)] = {
+                    "kind": collection_name,
+                    "body_name": str(body_name),
+                    "position": np.asarray(sim.data.body_xpos[body_id]).astype(float).tolist(),
+                    "quaternion": np.asarray(sim.data.body_xquat[body_id]).astype(float).tolist(),
+                }
+            except Exception:
+                continue
+
+    try:
+        for contact_idx in range(int(sim.data.ncon)):
+            contact = sim.data.contact[contact_idx]
+            geom1 = sim.model.geom_id2name(int(contact.geom1))
+            geom2 = sim.model.geom_id2name(int(contact.geom2))
+            snapshot["contacts"].append([str(geom1), str(geom2)])
+    except Exception:
+        pass
+    return snapshot
+
+
+def max_named_object_motion(before, after, name_fragment="bowl"):
+    """Return the largest position change for matching objects in two privileged snapshots."""
+    before_objects, after_objects = before.get("objects", {}), after.get("objects", {})
+    motions = {}
+    for name, before_state in before_objects.items():
+        if name_fragment.lower() not in name.lower() or name not in after_objects:
+            continue
+        before_pos = np.asarray(before_state["position"], dtype=float)
+        after_pos = np.asarray(after_objects[name]["position"], dtype=float)
+        motions[name] = float(np.linalg.norm(after_pos - before_pos))
+    if not motions:
+        return 0.0, None
+    moved_name = max(motions, key=motions.get)
+    return motions[moved_name], moved_name
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -353,15 +421,28 @@ def run_episode(
     # Setup
     t = 0
     replay_images = []
-    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
+    frequency_scale = cfg.control_freq / BASE_CONTROL_FREQ
+    max_steps = int(round(TASK_MAX_STEPS[cfg.task_suite_name] * frequency_scale))
+    wait_steps = int(round(cfg.num_steps_wait * frequency_scale))
     replan_idx = 0
+    active_chunk_idx = -1
+    chunk_start_snapshot = None
+    diagnostic_dir = Path(cfg.action_dump_dir) / f"task_{task_id:02d}" / f"state_{episode_idx:02d}"
+    chunks_path = diagnostic_dir / "chunks.jsonl"
+    steps_path = diagnostic_dir / "steps.jsonl"
+    events_path = diagnostic_dir / "events.jsonl"
+    if cfg.dump_action_chunks:
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        for diagnostic_path in (chunks_path, steps_path, events_path):
+            diagnostic_path.write_text("", encoding="utf-8")
+    forced_replans = 0
 
     # Run episode
     success = False
     try:
-        while t < max_steps + cfg.num_steps_wait:
+        while t < max_steps + wait_steps:
             # Do nothing for the first few timesteps to let objects stabilize
-            if t < cfg.num_steps_wait:
+            if t < wait_steps:
                 obs, reward, done, info = env.step(get_libero_dummy_action(cfg.model_family))
                 t += 1
                 continue
@@ -377,13 +458,14 @@ def run_episode(
                     observation["_camera_debug"].update(
                         {
                             "dump_dir": str(dump_dir),
-                            "prefix": f"replan_{replan_idx:03d}_step_{t - cfg.num_steps_wait:03d}",
+                            "prefix": f"replan_{replan_idx:03d}_step_{t - wait_steps:03d}",
                             "task_description": task_description,
                             "task_id": task_id,
                             "episode_idx": episode_idx,
                         }
                     )
                 # Query model to get action
+                inference_started = time.perf_counter()
                 actions = get_action(
                     cfg,
                     model,
@@ -395,22 +477,95 @@ def run_episode(
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
                 )
-                action_queue.extend(actions[: cfg.num_open_loop_steps])
+                inference_latency_ms = (time.perf_counter() - inference_started) * 1000.0
+                actions_array = np.asarray(actions, dtype=float)
+                if actions_array.ndim != 2 or actions_array.shape[1] != 7:
+                    raise ValueError(f"Expected action chunk shaped (N, 7), got {actions_array.shape}")
+                queued_count = min(len(actions), cfg.num_open_loop_steps)
+                action_queue.extend((action_idx, actions[action_idx]) for action_idx in range(queued_count))
+                active_chunk_idx = replan_idx
+                chunk_start_snapshot = collect_sim_snapshot(env)
+                if cfg.dump_action_chunks:
+                    processed_actions = [
+                        process_action(np.asarray(chunk_action).copy(), cfg.model_family).astype(float).tolist()
+                        for chunk_action in actions
+                    ]
+                    append_jsonl(
+                        chunks_path,
+                        {
+                            "chunk_index": replan_idx,
+                            "control_step": t - wait_steps,
+                            "sim_time_seconds": (t - wait_steps) / cfg.control_freq,
+                            "control_freq": cfg.control_freq,
+                            "inference_latency_ms": inference_latency_ms,
+                            "chunk_deadline_ms": cfg.num_open_loop_steps / cfg.control_freq * 1000.0,
+                            "chunk_deadline_met": inference_latency_ms
+                            <= cfg.num_open_loop_steps / cfg.control_freq * 1000.0,
+                            "predicted_shape": list(actions_array.shape),
+                            "open_loop_steps": cfg.num_open_loop_steps,
+                            "executed_action_indices_planned": list(range(queued_count)),
+                            "raw_actions": actions_array.tolist(),
+                            "processed_actions": processed_actions,
+                            "raw_gripper_commands": actions_array[:, -1].tolist(),
+                            "processed_gripper_commands": [action[-1] for action in processed_actions],
+                            "proprio": np.asarray(observation["state"], dtype=float).tolist(),
+                            "sim_snapshot_before_chunk": chunk_start_snapshot,
+                        },
+                    )
                 log_message(
                     f"Replan {replan_idx}: predicted {len(actions)} actions; "
-                    f"queued first {min(len(actions), cfg.num_open_loop_steps)}",
+                    f"queued first {min(len(actions), cfg.num_open_loop_steps)}; "
+                    f"inference {inference_latency_ms:.1f} ms",
                     log_file,
                 )
                 replan_idx += 1
 
             # Get action from queue
-            action = action_queue.popleft()
+            action_idx_in_chunk, action = action_queue.popleft()
 
             # Process action
             action = process_action(action, cfg.model_family)
 
+            if cfg.dump_action_chunks:
+                append_jsonl(
+                    steps_path,
+                    {
+                        "chunk_index": active_chunk_idx,
+                        "action_index_in_chunk": action_idx_in_chunk,
+                        "control_step": t - wait_steps,
+                        "sim_time_seconds": (t - wait_steps) / cfg.control_freq,
+                        "processed_action": np.asarray(action, dtype=float).tolist(),
+                        "queue_remaining_before_step": len(action_queue),
+                    },
+                )
+
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+            if cfg.target_motion_replan_threshold_m > 0 and action[-1] < 0 and chunk_start_snapshot is not None:
+                current_snapshot = collect_sim_snapshot(env)
+                target_motion, moved_target = max_named_object_motion(chunk_start_snapshot, current_snapshot, "bowl")
+                if target_motion >= cfg.target_motion_replan_threshold_m and len(action_queue) > 0:
+                    discarded_actions = len(action_queue)
+                    action_queue.clear()
+                    forced_replans += 1
+                    event = {
+                        "event": "target_motion_forced_replan",
+                        "chunk_index": active_chunk_idx,
+                        "action_index_in_chunk": action_idx_in_chunk,
+                        "control_step": t - wait_steps,
+                        "target_name": moved_target,
+                        "target_motion_m": target_motion,
+                        "threshold_m": cfg.target_motion_replan_threshold_m,
+                        "discarded_queued_actions": discarded_actions,
+                        "gripper_command": float(action[-1]),
+                    }
+                    if cfg.dump_action_chunks:
+                        append_jsonl(events_path, event)
+                    log_message(
+                        f"Target moved {target_motion:.4f} m while gripper was open; "
+                        f"discarded {discarded_actions} queued actions and will replan",
+                        log_file,
+                    )
             if done:
                 success = True
                 break
@@ -418,6 +573,24 @@ def run_episode(
 
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
+
+    if cfg.dump_action_chunks:
+        summary = {
+            "task_id": task_id,
+            "initial_state_index": episode_idx,
+            "task_description": task_description,
+            "success": success,
+            "control_freq": cfg.control_freq,
+            "num_open_loop_steps": cfg.num_open_loop_steps,
+            "target_motion_replan_threshold_m": cfg.target_motion_replan_threshold_m,
+            "replan_count": replan_idx,
+            "forced_replan_count": forced_replans,
+            "executed_control_steps": max(0, t - wait_steps),
+            "simulated_duration_seconds": max(0, t - wait_steps) / cfg.control_freq,
+        }
+        (diagnostic_dir / "episode_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     return success, replay_images
 
@@ -445,7 +618,9 @@ def run_task(
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
 
     # Initialize environment and get task description
-    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    env, task_description = get_libero_env(
+        task, cfg.model_family, resolution=cfg.env_img_res, control_freq=cfg.control_freq
+    )
 
     # Start episodes
     task_episodes, task_successes = 0, 0
@@ -563,6 +738,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Wrist image feature weight: {cfg.wrist_image_weight}", log_file)
     log_message(f"Target episodes (zero-based task:state): {target_episodes or 'ALL'}", log_file)
     log_message(f"Camera input dump: {cfg.dump_camera_inputs} -> {cfg.camera_dump_dir}", log_file)
+    log_message(f"Action chunk dump: {cfg.dump_action_chunks} -> {cfg.action_dump_dir}", log_file)
+    log_message(f"Target-motion replan threshold: {cfg.target_motion_replan_threshold_m} m", log_file)
+    log_message(f"LIBERO control frequency: {cfg.control_freq} Hz", log_file)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0

@@ -197,6 +197,13 @@ OXE_NAMED_MIXTURES: Dict[str, List[Tuple[str, float]]] = {
     "libero_spatial_no_noops": [
         ("libero_spatial_no_noops", 1.0),
     ],
+    "libero_spatial_top_drawer_dagger_only": [
+        ("libero_spatial_top_drawer_dagger", 1.0),
+    ],
+    "libero_spatial_plus_top_drawer_dagger": [
+        ("libero_spatial_no_noops", 1.0),
+        ("libero_spatial_top_drawer_dagger", 5.0),
+    ],
     "libero_object_no_noops": [
         ("libero_object_no_noops", 1.0),
     ],
