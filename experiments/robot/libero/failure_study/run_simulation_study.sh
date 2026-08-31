@@ -26,6 +26,9 @@ case "${MODE}" in
   grasp_verify)
     study_run_eval "sim-grasp-verify" "4:29,5:35" 8 1.0 False True 0.0 20 True
     ;;
+  grasp_recovery)
+    study_run_eval "sim-grasp-recovery" "4:29,5:35" 8 1.0 False True 0.0 20 True
+    ;;
   freq20)
     study_run_eval "sim-frequency-20hz" "4:32,6:20,7:27" 4 1.0 False True 0.0 20
     ;;
@@ -43,7 +46,7 @@ case "${MODE}" in
     study_run_eval "sim-frequency-50hz" "4:32,6:20,7:27" 4 1.0 False True 0.0 50
     ;;
   *)
-    echo "Usage: $0 {boundary8|boundary4|relocalize_control|relocalize_motion|grasp_control|grasp_verify|freq20|freq50|all}" >&2
+    echo "Usage: $0 {boundary8|boundary4|relocalize_control|relocalize_motion|grasp_control|grasp_verify|grasp_recovery|freq20|freq50|all}" >&2
     exit 2
     ;;
 esac

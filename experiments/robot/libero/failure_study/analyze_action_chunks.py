@@ -133,6 +133,7 @@ def analyze_episode(summary_path: Path, translation_threshold: float):
         "forced_replans": episode.get("forced_replan_count", 0),
         "grasp_checks": episode.get("grasp_check_count", 0),
         "empty_grasp_replans": episode.get("empty_grasp_replan_count", 0),
+        "grasp_retry_exhausted": episode.get("grasp_retry_exhausted", False),
         "first_close_chunk": first_close[0] if first_close else None,
         "first_close_action_index": first_close[1] if first_close else None,
         "first_close_at_boundary": bool(first_close and first_close[1] == 0),
@@ -177,8 +178,8 @@ def main():
         f"- Successes: {successful}",
         f"- Failures: {len(episode_rows) - successful}",
         "",
-        "| Task | State | Hz | Open-loop | Success | First close | First transfer | Deadline met | Grasp checks | Empty-grasp replans | Forced replans |",
-        "|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|",
+        "| Task | State | Hz | Open-loop | Success | First close | First transfer | Deadline met | Grasp checks | Empty-grasp replans | Retry exhausted | Forced replans |",
+        "|---:|---:|---:|---:|---|---|---|---:|---:|---:|---|---:|",
     ]
     for row in episode_rows:
         close = f"c{row['first_close_chunk']}/a{row['first_close_action_index']}"
@@ -187,11 +188,13 @@ def main():
         report_lines.append(
             f"| {row['task_id']} | {row['initial_state_index']} | {row['control_freq']} | "
             f"{row['open_loop_steps']} | {row['success']} | {close} | {transfer} | "
-            f"{deadline_rate:.1%} | {row['grasp_checks']} | {row['empty_grasp_replans']} | {row['forced_replans']} |"
+            f"{deadline_rate:.1%} | {row['grasp_checks']} | {row['empty_grasp_replans']} | "
+            f"{row['grasp_retry_exhausted']} | {row['forced_replans']} |"
             if deadline_rate is not None
             else f"| {row['task_id']} | {row['initial_state_index']} | {row['control_freq']} | "
             f"{row['open_loop_steps']} | {row['success']} | {close} | {transfer} | N/A | "
-            f"{row['grasp_checks']} | {row['empty_grasp_replans']} | {row['forced_replans']} |"
+            f"{row['grasp_checks']} | {row['empty_grasp_replans']} | "
+            f"{row['grasp_retry_exhausted']} | {row['forced_replans']} |"
         )
     report_lines.extend(
         [

@@ -232,19 +232,22 @@ bash experiments/robot/libero/failure_study/run_simulation_study.sh grasp_contro
 再开启仿真真值抓取确认：
 
 ```bash
-bash experiments/robot/libero/failure_study/run_simulation_study.sh grasp_verify
+bash experiments/robot/libero/failure_study/run_simulation_study.sh grasp_recovery
 ```
 
-检测器在夹爪从打开切换为闭合时选取距离末端最近的 `bowl`。末端移动至少2 cm后，同时检查：
+该模式只干预仿真执行层，不修改模型、图像或预测chunk。检测到夹爪首次闭合时：
 
-- robosuite的左右指垫是否都与该物体接触；
-- 物体中心与夹爪抓取点距离是否不超过12 cm；
-- 物体是否至少移动1 cm；
-- 物体相对夹爪的位置漂移是否不超过1.5 cm。
+1. 立即清空chunk中尚未执行的动作；
+2. 执行当前策略给出的闭合动作，再追加2个零位移闭合控制步；
+3. 使用robosuite检查左右指垫接触，且目标中心与夹爪抓取点距离不超过12 cm；
+4. 抓取有效则从新观测重新推理；
+5. 空抓则原地张开4个控制步，再从新观测重新接近；
+6. 连续3次空抓后记录 `grasp_retry_exhausted` 并结束该episode。
 
-若任一条件不满足，脚本清空当前chunk剩余动作并立即重新推理。`events.jsonl`记录
-`grasp_verified` 或 `empty_grasp_forced_replan`，汇总表新增 `Grasp checks` 与
-`Empty-grasp replans` 两列。以上阈值都是仿真消融参数，应根据首轮事件日志校准，不能直接迁移到真实机器人。
+`events.jsonl`记录 `grasp_close_intercepted`、`grasp_verified`、
+`empty_grasp_forced_replan`、`grasp_recovery_opened` 和 `grasp_retry_exhausted`。
+汇总表包含 `Grasp checks`、`Empty-grasp replans` 与 `Retry exhausted`。这是使用
+MuJoCo/robosuite真值的仿真消融，不能直接迁移到真实机器人。
 
 ### 5.4 20 Hz与50 Hz
 

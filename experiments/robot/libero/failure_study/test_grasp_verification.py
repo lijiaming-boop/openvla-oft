@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Small check for the privileged grasp-following rule."""
+"""Small check for the simulator-only grasp contact rule."""
 
-from grasp_verification import evaluate_grasp_following
-
-
-def snapshot(position):
-    return {"objects": {"black_bowl": {"position": position}}}
+from grasp_verification import grasp_contact_is_valid
 
 
 if __name__ == "__main__":
-    held = evaluate_grasp_following(
-        snapshot([0, 0, 0]), snapshot([0.03, 0, 0]), "black_bowl",
-        [0, 0, 0.1], [0.03, 0, 0.1], 0.02, 0.01, 0.015,
+    assert grasp_contact_is_valid(
+        {"two_finger_contact": True, "gripper_target_distance_m": 0.06}, 0.12
     )
-    empty = evaluate_grasp_following(
-        snapshot([0, 0, 0]), snapshot([0, 0, 0]), "black_bowl",
-        [0, 0, 0.1], [0.03, 0, 0.1], 0.02, 0.01, 0.015,
+    assert not grasp_contact_is_valid(
+        {"two_finger_contact": False, "gripper_target_distance_m": 0.06}, 0.12
     )
-    assert held["verified"]
-    assert not empty["verified"]
+    assert not grasp_contact_is_valid(
+        {"two_finger_contact": True, "gripper_target_distance_m": 0.13}, 0.12
+    )
     print("grasp verification rule: OK")

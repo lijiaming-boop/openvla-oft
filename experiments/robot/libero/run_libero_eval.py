@@ -33,7 +33,7 @@ from experiments.robot.libero.libero_utils import (
     save_rollout_video,
 )
 from experiments.robot.libero.failure_study.grasp_verification import (
-    evaluate_grasp_following,
+    grasp_contact_is_valid,
     nearest_named_object,
 )
 from experiments.robot.openvla_utils import (
@@ -127,12 +127,12 @@ class GenerateConfig:
     dump_action_chunks: bool = False                 # Save each predicted 8x7 chunk and executed gripper commands
     action_dump_dir: str = "./experiments/action_dumps"  # Root directory for action/simulator diagnostics
     target_motion_replan_threshold_m: float = 0.0    # Privileged sim ablation; 0 disables target-motion replanning
-    verify_grasp: bool = False                       # Privileged sim check: object must follow gripper after close
+    verify_grasp: bool = False                       # Simulator-only close/verify/open/retry state machine
     grasp_target_fragment: str = "bowl"             # Object-name fragment used by privileged grasp verification
-    grasp_verify_eef_motion_m: float = 0.02          # Wait for this much end-effector motion before checking
-    grasp_verify_target_motion_m: float = 0.01       # Target must move at least this far with the gripper
-    grasp_verify_max_relative_drift_m: float = 0.015 # Maximum change in target-to-gripper offset
     grasp_verify_max_distance_m: float = 0.12        # Maximum target-center to gripper-site distance
+    grasp_close_hold_steps: int = 2                  # Extra zero-motion close steps before checking contact
+    grasp_open_recovery_steps: int = 4               # Zero-motion open steps after an empty grasp
+    grasp_max_retries: int = 3                       # Stop the episode after this many empty grasps
     control_freq: int = BASE_CONTROL_FREQ            # LIBERO controller frequency; baseline is 20 Hz
 
     #################################################################################################################
@@ -164,10 +164,10 @@ def validate_config(cfg: GenerateConfig) -> None:
     assert cfg.wrist_image_weight > 0, "wrist_image_weight must be positive!"
     assert cfg.target_motion_replan_threshold_m >= 0, "target_motion_replan_threshold_m must be non-negative!"
     assert cfg.grasp_target_fragment.strip(), "grasp_target_fragment must not be empty!"
-    assert cfg.grasp_verify_eef_motion_m > 0, "grasp_verify_eef_motion_m must be positive!"
-    assert cfg.grasp_verify_target_motion_m >= 0, "grasp_verify_target_motion_m must be non-negative!"
-    assert cfg.grasp_verify_max_relative_drift_m >= 0, "grasp_verify_max_relative_drift_m must be non-negative!"
     assert cfg.grasp_verify_max_distance_m > 0, "grasp_verify_max_distance_m must be positive!"
+    assert cfg.grasp_close_hold_steps > 0, "grasp_close_hold_steps must be positive!"
+    assert cfg.grasp_open_recovery_steps > 0, "grasp_open_recovery_steps must be positive!"
+    assert cfg.grasp_max_retries > 0, "grasp_max_retries must be positive!"
     assert cfg.control_freq > 0, "control_freq must be positive!"
 
     # Validate task suite
@@ -473,7 +473,14 @@ def run_episode(
     grasp_checks = 0
     empty_grasp_replans = 0
     previous_gripper_command = -1.0
-    grasp_candidate = None
+    grasp_phase = None
+    grasp_steps_remaining = 0
+    grasp_target_name = None
+    grasp_close_chunk_idx = -1
+    grasp_close_action_idx = -1
+    grasp_discarded_actions = 0
+    grasp_retry_count = 0
+    grasp_retry_exhausted = False
 
     # Run episode
     success = False
@@ -490,7 +497,7 @@ def run_episode(
             replay_images.append(img)
 
             # If action queue is empty, requery model
-            if len(action_queue) == 0:
+            if grasp_phase is None and len(action_queue) == 0:
                 if cfg.dump_camera_inputs:
                     dump_dir = Path(cfg.camera_dump_dir) / f"task_{task_id:02d}" / f"state_{episode_idx:02d}"
                     observation["_camera_debug"].update(
@@ -558,28 +565,48 @@ def run_episode(
                 )
                 replan_idx += 1
 
-            # Get action from queue
-            action_idx_in_chunk, action = action_queue.popleft()
+            intervention_phase = grasp_phase
+            if intervention_phase is not None:
+                action_idx_in_chunk = -1
+                action = np.zeros(7, dtype=float)
+                action[-1] = 1.0 if intervention_phase == "close_hold" else -1.0
+            else:
+                action_idx_in_chunk, action = action_queue.popleft()
+                action = process_action(np.asarray(action).copy(), cfg.model_family)
 
-            # Process action
-            action = process_action(action, cfg.model_family)
-
-            if cfg.verify_grasp and previous_gripper_command < 0 <= action[-1]:
-                close_snapshot = collect_sim_snapshot(env)
-                target_name = nearest_named_object(
-                    close_snapshot, obs["robot0_eef_pos"], cfg.grasp_target_fragment
-                )
-                grasp_candidate = (
-                    {
-                        "target_name": target_name,
-                        "snapshot": close_snapshot,
-                        "eef_position": np.asarray(obs["robot0_eef_pos"], dtype=float).tolist(),
-                        "chunk_index": active_chunk_idx,
-                        "action_index_in_chunk": action_idx_in_chunk,
-                    }
-                    if target_name is not None
-                    else None
-                )
+                if cfg.verify_grasp and previous_gripper_command < 0 <= action[-1]:
+                    close_snapshot = collect_sim_snapshot(env)
+                    grasp_target_name = nearest_named_object(
+                        close_snapshot, obs["robot0_eef_pos"], cfg.grasp_target_fragment
+                    )
+                    if grasp_target_name is not None:
+                        grasp_close_chunk_idx = active_chunk_idx
+                        grasp_close_action_idx = action_idx_in_chunk
+                        grasp_discarded_actions = len(action_queue)
+                        action_queue.clear()
+                        grasp_phase = "close_hold"
+                        intervention_phase = "close_hold"
+                        # The current policy close is executed once; the configured zero-motion
+                        # holds follow it so a final approach encoded with close is not discarded.
+                        grasp_steps_remaining = cfg.grasp_close_hold_steps + 1
+                        event = {
+                            "event": "grasp_close_intercepted",
+                            "target_name": grasp_target_name,
+                            "chunk_index": active_chunk_idx,
+                            "action_index_in_chunk": action_idx_in_chunk,
+                            "control_step": t - wait_steps,
+                            "discarded_queued_actions": grasp_discarded_actions,
+                            "close_hold_steps": cfg.grasp_close_hold_steps,
+                            "retry_number": grasp_retry_count + 1,
+                        }
+                        if cfg.dump_action_chunks:
+                            append_jsonl(events_path, event)
+                        log_message(
+                            f"Intercepted close for {grasp_target_name}; discarded "
+                            f"{grasp_discarded_actions} queued actions and holding closed for "
+                            f"{cfg.grasp_close_hold_steps} extra steps",
+                            log_file,
+                        )
 
             if cfg.dump_action_chunks:
                 append_jsonl(
@@ -591,79 +618,94 @@ def run_episode(
                         "sim_time_seconds": (t - wait_steps) / cfg.control_freq,
                         "processed_action": np.asarray(action, dtype=float).tolist(),
                         "queue_remaining_before_step": len(action_queue),
+                        "simulation_intervention": intervention_phase is not None,
+                        "intervention_phase": intervention_phase,
                     },
                 )
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
-            grasp_failed = False
-            if cfg.verify_grasp and grasp_candidate is not None and action[-1] >= 0:
-                current_snapshot = collect_sim_snapshot(env)
-                grasp_result = evaluate_grasp_following(
-                    grasp_candidate["snapshot"],
-                    current_snapshot,
-                    grasp_candidate["target_name"],
-                    grasp_candidate["eef_position"],
-                    obs["robot0_eef_pos"],
-                    cfg.grasp_verify_eef_motion_m,
-                    cfg.grasp_verify_target_motion_m,
-                    cfg.grasp_verify_max_relative_drift_m,
-                )
-                if grasp_result is not None:
-                    grasp_state = collect_sim_grasp_state(env, grasp_candidate["target_name"])
+            previous_gripper_command = float(action[-1])
+            if intervention_phase is not None:
+                grasp_steps_remaining -= 1
+                if grasp_steps_remaining == 0 and intervention_phase == "close_hold":
+                    grasp_state = collect_sim_grasp_state(env, grasp_target_name)
                     if grasp_state is None:
                         log_message(
-                            f"Grasp check unavailable for {grasp_candidate['target_name']}; "
-                            "leaving the action queue unchanged",
+                            f"Grasp contact check unavailable for {grasp_target_name}; disabling intervention",
                             log_file,
                         )
-                        grasp_candidate = None
+                        grasp_phase = None
+                        grasp_target_name = None
                     else:
-                        grasp_result.update(grasp_state)
-                        grasp_result["verified"] = bool(
-                            grasp_result["verified"]
-                            and grasp_state["two_finger_contact"]
-                            and grasp_state["gripper_target_distance_m"] <= cfg.grasp_verify_max_distance_m
-                        )
+                        verified = grasp_contact_is_valid(grasp_state, cfg.grasp_verify_max_distance_m)
                         grasp_checks += 1
-                        discarded_actions = 0
-                        if not grasp_result["verified"]:
-                            discarded_actions = len(action_queue)
-                            action_queue.clear()
-                            forced_replans += 1
-                            empty_grasp_replans += 1
-                            grasp_failed = True
+                        attempt_number = grasp_retry_count + 1
                         event = {
-                            "event": "grasp_verified" if grasp_result["verified"] else "empty_grasp_forced_replan",
-                            "target_name": grasp_candidate["target_name"],
-                            "close_chunk_index": grasp_candidate["chunk_index"],
-                            "close_action_index_in_chunk": grasp_candidate["action_index_in_chunk"],
-                            "check_chunk_index": active_chunk_idx,
-                            "check_action_index_in_chunk": action_idx_in_chunk,
+                            "event": "grasp_verified" if verified else "empty_grasp_forced_replan",
+                            "target_name": grasp_target_name,
+                            "close_chunk_index": grasp_close_chunk_idx,
+                            "close_action_index_in_chunk": grasp_close_action_idx,
                             "control_step": t - wait_steps,
-                            "discarded_queued_actions": discarded_actions,
-                            **grasp_result,
+                            "discarded_queued_actions": grasp_discarded_actions,
+                            "retry_number": attempt_number,
+                            "verified": verified,
+                            **grasp_state,
                         }
                         if cfg.dump_action_chunks:
                             append_jsonl(events_path, event)
                         log_message(
-                            f"Grasp check for {grasp_candidate['target_name']}: "
-                            f"verified={grasp_result['verified']}, "
-                            f"eef_motion={grasp_result['eef_motion_m']:.4f} m, "
-                            f"target_motion={grasp_result['target_motion_m']:.4f} m, "
-                            f"relative_drift={grasp_result['relative_drift_m']:.4f} m; "
-                            f"two_finger_contact={grasp_result['two_finger_contact']}, "
-                            f"distance={grasp_result['gripper_target_distance_m']:.4f} m; "
-                            f"discarded={discarded_actions}",
+                            f"Grasp contact check for {grasp_target_name}: verified={verified}, "
+                            f"two_finger_contact={grasp_state['two_finger_contact']}, "
+                            f"distance={grasp_state['gripper_target_distance_m']:.4f} m, "
+                            f"attempt={attempt_number}/{cfg.grasp_max_retries}",
                             log_file,
                         )
-                        grasp_candidate = None
-
-            # A failed check is treated as a fresh open->close opportunity on the next plan. This
-            # prevents an empty, still-closed gripper from continuing a transfer indefinitely.
-            previous_gripper_command = -1.0 if grasp_failed else float(action[-1])
-            if action[-1] < 0:
-                grasp_candidate = None
+                        if verified:
+                            grasp_phase = None
+                            grasp_target_name = None
+                            grasp_retry_count = 0
+                        else:
+                            forced_replans += 1
+                            empty_grasp_replans += 1
+                            grasp_retry_count += 1
+                            if grasp_retry_count >= cfg.grasp_max_retries:
+                                grasp_retry_exhausted = True
+                                exhausted_event = {
+                                    "event": "grasp_retry_exhausted",
+                                    "target_name": grasp_target_name,
+                                    "control_step": t - wait_steps,
+                                    "retry_count": grasp_retry_count,
+                                }
+                                if cfg.dump_action_chunks:
+                                    append_jsonl(events_path, exhausted_event)
+                                log_message(
+                                    f"Grasp recovery exhausted after {grasp_retry_count} attempts; ending episode",
+                                    log_file,
+                                )
+                                break
+                            grasp_phase = "open_hold"
+                            grasp_steps_remaining = cfg.grasp_open_recovery_steps
+                            log_message(
+                                f"Empty grasp detected; opening in place for "
+                                f"{cfg.grasp_open_recovery_steps} steps before replanning",
+                                log_file,
+                            )
+                elif grasp_steps_remaining == 0 and intervention_phase == "open_hold":
+                    if cfg.dump_action_chunks:
+                        append_jsonl(
+                            events_path,
+                            {
+                                "event": "grasp_recovery_opened",
+                                "target_name": grasp_target_name,
+                                "control_step": t - wait_steps,
+                                "retry_count": grasp_retry_count,
+                            },
+                        )
+                    log_message("Recovery open-hold complete; replanning from the new observation", log_file)
+                    grasp_phase = None
+                    grasp_target_name = None
+                    action_queue.clear()
             if cfg.target_motion_replan_threshold_m > 0 and action[-1] < 0 and chunk_start_snapshot is not None:
                 current_snapshot = collect_sim_snapshot(env)
                 target_motion, moved_target = max_named_object_motion(chunk_start_snapshot, current_snapshot, "bowl")
@@ -709,6 +751,8 @@ def run_episode(
             "verify_grasp": cfg.verify_grasp,
             "grasp_check_count": grasp_checks,
             "empty_grasp_replan_count": empty_grasp_replans,
+            "grasp_retry_count": grasp_retry_count,
+            "grasp_retry_exhausted": grasp_retry_exhausted,
             "replan_count": replan_idx,
             "forced_replan_count": forced_replans,
             "executed_control_steps": max(0, t - wait_steps),
@@ -868,9 +912,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Target-motion replan threshold: {cfg.target_motion_replan_threshold_m} m", log_file)
     log_message(
         f"Privileged grasp verification: {cfg.verify_grasp} "
-        f"(target={cfg.grasp_target_fragment!r}, eef_motion={cfg.grasp_verify_eef_motion_m} m, "
-        f"target_motion={cfg.grasp_verify_target_motion_m} m, "
-        f"relative_drift={cfg.grasp_verify_max_relative_drift_m} m, "
+        f"(target={cfg.grasp_target_fragment!r}, close_hold={cfg.grasp_close_hold_steps}, "
+        f"open_hold={cfg.grasp_open_recovery_steps}, retries={cfg.grasp_max_retries}, "
         f"max_distance={cfg.grasp_verify_max_distance_m} m)",
         log_file,
     )

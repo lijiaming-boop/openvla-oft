@@ -35,6 +35,9 @@ study_run_eval() {
   local motion_threshold="$7"
   local control_freq="$8"
   local verify_grasp="${9:-False}"
+  local grasp_close_hold_steps="${GRASP_CLOSE_HOLD_STEPS:-2}"
+  local grasp_open_recovery_steps="${GRASP_OPEN_RECOVERY_STEPS:-4}"
+  local grasp_max_retries="${GRASP_MAX_RETRIES:-3}"
   local run_root="${STUDY_OUTPUT_ROOT}/${label}"
 
   mkdir -p "${run_root}"
@@ -46,6 +49,9 @@ study_run_eval() {
     "target_motion_replan_threshold_m=${motion_threshold}" \
     "control_freq=${control_freq}" \
     "verify_grasp=${verify_grasp}" \
+    "grasp_close_hold_steps=${grasp_close_hold_steps}" \
+    "grasp_open_recovery_steps=${grasp_open_recovery_steps}" \
+    "grasp_max_retries=${grasp_max_retries}" \
     "checkpoint=${STUDY_CKPT_DIR}" \
     > "${run_root}/run_config.txt"
 
@@ -64,6 +70,9 @@ study_run_eval() {
       --action_dump_dir "${run_root}/actions" \
       --target_motion_replan_threshold_m "${motion_threshold}" \
       --verify_grasp "${verify_grasp}" \
+      --grasp_close_hold_steps "${grasp_close_hold_steps}" \
+      --grasp_open_recovery_steps "${grasp_open_recovery_steps}" \
+      --grasp_max_retries "${grasp_max_retries}" \
       --control_freq "${control_freq}" \
       --run_id_note "${label}"
   ) 2>&1 | tee "${run_root}/console.log"
