@@ -34,6 +34,7 @@ study_run_eval() {
   local dump_actions="$6"
   local motion_threshold="$7"
   local control_freq="$8"
+  local verify_grasp="${9:-False}"
   local run_root="${STUDY_OUTPUT_ROOT}/${label}"
 
   mkdir -p "${run_root}"
@@ -44,6 +45,7 @@ study_run_eval() {
     "wrist_image_weight=${wrist_weight}" \
     "target_motion_replan_threshold_m=${motion_threshold}" \
     "control_freq=${control_freq}" \
+    "verify_grasp=${verify_grasp}" \
     "checkpoint=${STUDY_CKPT_DIR}" \
     > "${run_root}/run_config.txt"
 
@@ -61,6 +63,7 @@ study_run_eval() {
       --dump_action_chunks "${dump_actions}" \
       --action_dump_dir "${run_root}/actions" \
       --target_motion_replan_threshold_m "${motion_threshold}" \
+      --verify_grasp "${verify_grasp}" \
       --control_freq "${control_freq}" \
       --run_id_note "${label}"
   ) 2>&1 | tee "${run_root}/console.log"

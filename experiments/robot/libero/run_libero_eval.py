@@ -32,6 +32,10 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
+from experiments.robot.libero.failure_study.grasp_verification import (
+    evaluate_grasp_following,
+    nearest_named_object,
+)
 from experiments.robot.openvla_utils import (
     get_action_head,
     get_noisy_action_projector,
@@ -123,6 +127,12 @@ class GenerateConfig:
     dump_action_chunks: bool = False                 # Save each predicted 8x7 chunk and executed gripper commands
     action_dump_dir: str = "./experiments/action_dumps"  # Root directory for action/simulator diagnostics
     target_motion_replan_threshold_m: float = 0.0    # Privileged sim ablation; 0 disables target-motion replanning
+    verify_grasp: bool = False                       # Privileged sim check: object must follow gripper after close
+    grasp_target_fragment: str = "bowl"             # Object-name fragment used by privileged grasp verification
+    grasp_verify_eef_motion_m: float = 0.02          # Wait for this much end-effector motion before checking
+    grasp_verify_target_motion_m: float = 0.01       # Target must move at least this far with the gripper
+    grasp_verify_max_relative_drift_m: float = 0.015 # Maximum change in target-to-gripper offset
+    grasp_verify_max_distance_m: float = 0.12        # Maximum target-center to gripper-site distance
     control_freq: int = BASE_CONTROL_FREQ            # LIBERO controller frequency; baseline is 20 Hz
 
     #################################################################################################################
@@ -153,6 +163,11 @@ def validate_config(cfg: GenerateConfig) -> None:
     )
     assert cfg.wrist_image_weight > 0, "wrist_image_weight must be positive!"
     assert cfg.target_motion_replan_threshold_m >= 0, "target_motion_replan_threshold_m must be non-negative!"
+    assert cfg.grasp_target_fragment.strip(), "grasp_target_fragment must not be empty!"
+    assert cfg.grasp_verify_eef_motion_m > 0, "grasp_verify_eef_motion_m must be positive!"
+    assert cfg.grasp_verify_target_motion_m >= 0, "grasp_verify_target_motion_m must be non-negative!"
+    assert cfg.grasp_verify_max_relative_drift_m >= 0, "grasp_verify_max_relative_drift_m must be non-negative!"
+    assert cfg.grasp_verify_max_distance_m > 0, "grasp_verify_max_distance_m must be positive!"
     assert cfg.control_freq > 0, "control_freq must be positive!"
 
     # Validate task suite
@@ -240,6 +255,25 @@ def max_named_object_motion(before, after, name_fragment="bowl"):
         return 0.0, None
     moved_name = max(motions, key=motions.get)
     return motions[moved_name], moved_name
+
+
+def collect_sim_grasp_state(env, target_name):
+    """Return robosuite's two-finger grasp label and gripper-to-target distance."""
+    wrapped_env = getattr(env, "env", env)
+    target = (getattr(wrapped_env, "objects_dict", {}) or {}).get(target_name)
+    robots = getattr(wrapped_env, "robots", [])
+    if target is None or not robots:
+        return None
+    try:
+        gripper = robots[0].gripper
+        return {
+            "two_finger_contact": bool(wrapped_env._check_grasp(gripper=gripper, object_geoms=target)),
+            "gripper_target_distance_m": float(
+                wrapped_env._gripper_to_target(gripper, target, return_distance=True)
+            ),
+        }
+    except Exception:
+        return None
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -436,6 +470,10 @@ def run_episode(
         for diagnostic_path in (chunks_path, steps_path, events_path):
             diagnostic_path.write_text("", encoding="utf-8")
     forced_replans = 0
+    grasp_checks = 0
+    empty_grasp_replans = 0
+    previous_gripper_command = -1.0
+    grasp_candidate = None
 
     # Run episode
     success = False
@@ -526,6 +564,23 @@ def run_episode(
             # Process action
             action = process_action(action, cfg.model_family)
 
+            if cfg.verify_grasp and previous_gripper_command < 0 <= action[-1]:
+                close_snapshot = collect_sim_snapshot(env)
+                target_name = nearest_named_object(
+                    close_snapshot, obs["robot0_eef_pos"], cfg.grasp_target_fragment
+                )
+                grasp_candidate = (
+                    {
+                        "target_name": target_name,
+                        "snapshot": close_snapshot,
+                        "eef_position": np.asarray(obs["robot0_eef_pos"], dtype=float).tolist(),
+                        "chunk_index": active_chunk_idx,
+                        "action_index_in_chunk": action_idx_in_chunk,
+                    }
+                    if target_name is not None
+                    else None
+                )
+
             if cfg.dump_action_chunks:
                 append_jsonl(
                     steps_path,
@@ -541,6 +596,74 @@ def run_episode(
 
             # Execute action in environment
             obs, reward, done, info = env.step(action.tolist())
+            grasp_failed = False
+            if cfg.verify_grasp and grasp_candidate is not None and action[-1] >= 0:
+                current_snapshot = collect_sim_snapshot(env)
+                grasp_result = evaluate_grasp_following(
+                    grasp_candidate["snapshot"],
+                    current_snapshot,
+                    grasp_candidate["target_name"],
+                    grasp_candidate["eef_position"],
+                    obs["robot0_eef_pos"],
+                    cfg.grasp_verify_eef_motion_m,
+                    cfg.grasp_verify_target_motion_m,
+                    cfg.grasp_verify_max_relative_drift_m,
+                )
+                if grasp_result is not None:
+                    grasp_state = collect_sim_grasp_state(env, grasp_candidate["target_name"])
+                    if grasp_state is None:
+                        log_message(
+                            f"Grasp check unavailable for {grasp_candidate['target_name']}; "
+                            "leaving the action queue unchanged",
+                            log_file,
+                        )
+                        grasp_candidate = None
+                    else:
+                        grasp_result.update(grasp_state)
+                        grasp_result["verified"] = bool(
+                            grasp_result["verified"]
+                            and grasp_state["two_finger_contact"]
+                            and grasp_state["gripper_target_distance_m"] <= cfg.grasp_verify_max_distance_m
+                        )
+                        grasp_checks += 1
+                        discarded_actions = 0
+                        if not grasp_result["verified"]:
+                            discarded_actions = len(action_queue)
+                            action_queue.clear()
+                            forced_replans += 1
+                            empty_grasp_replans += 1
+                            grasp_failed = True
+                        event = {
+                            "event": "grasp_verified" if grasp_result["verified"] else "empty_grasp_forced_replan",
+                            "target_name": grasp_candidate["target_name"],
+                            "close_chunk_index": grasp_candidate["chunk_index"],
+                            "close_action_index_in_chunk": grasp_candidate["action_index_in_chunk"],
+                            "check_chunk_index": active_chunk_idx,
+                            "check_action_index_in_chunk": action_idx_in_chunk,
+                            "control_step": t - wait_steps,
+                            "discarded_queued_actions": discarded_actions,
+                            **grasp_result,
+                        }
+                        if cfg.dump_action_chunks:
+                            append_jsonl(events_path, event)
+                        log_message(
+                            f"Grasp check for {grasp_candidate['target_name']}: "
+                            f"verified={grasp_result['verified']}, "
+                            f"eef_motion={grasp_result['eef_motion_m']:.4f} m, "
+                            f"target_motion={grasp_result['target_motion_m']:.4f} m, "
+                            f"relative_drift={grasp_result['relative_drift_m']:.4f} m; "
+                            f"two_finger_contact={grasp_result['two_finger_contact']}, "
+                            f"distance={grasp_result['gripper_target_distance_m']:.4f} m; "
+                            f"discarded={discarded_actions}",
+                            log_file,
+                        )
+                        grasp_candidate = None
+
+            # A failed check is treated as a fresh open->close opportunity on the next plan. This
+            # prevents an empty, still-closed gripper from continuing a transfer indefinitely.
+            previous_gripper_command = -1.0 if grasp_failed else float(action[-1])
+            if action[-1] < 0:
+                grasp_candidate = None
             if cfg.target_motion_replan_threshold_m > 0 and action[-1] < 0 and chunk_start_snapshot is not None:
                 current_snapshot = collect_sim_snapshot(env)
                 target_motion, moved_target = max_named_object_motion(chunk_start_snapshot, current_snapshot, "bowl")
@@ -583,6 +706,9 @@ def run_episode(
             "control_freq": cfg.control_freq,
             "num_open_loop_steps": cfg.num_open_loop_steps,
             "target_motion_replan_threshold_m": cfg.target_motion_replan_threshold_m,
+            "verify_grasp": cfg.verify_grasp,
+            "grasp_check_count": grasp_checks,
+            "empty_grasp_replan_count": empty_grasp_replans,
             "replan_count": replan_idx,
             "forced_replan_count": forced_replans,
             "executed_control_steps": max(0, t - wait_steps),
@@ -740,6 +866,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Camera input dump: {cfg.dump_camera_inputs} -> {cfg.camera_dump_dir}", log_file)
     log_message(f"Action chunk dump: {cfg.dump_action_chunks} -> {cfg.action_dump_dir}", log_file)
     log_message(f"Target-motion replan threshold: {cfg.target_motion_replan_threshold_m} m", log_file)
+    log_message(
+        f"Privileged grasp verification: {cfg.verify_grasp} "
+        f"(target={cfg.grasp_target_fragment!r}, eef_motion={cfg.grasp_verify_eef_motion_m} m, "
+        f"target_motion={cfg.grasp_verify_target_motion_m} m, "
+        f"relative_drift={cfg.grasp_verify_max_relative_drift_m} m, "
+        f"max_distance={cfg.grasp_verify_max_distance_m} m)",
+        log_file,
+    )
     log_message(f"LIBERO control frequency: {cfg.control_freq} Hz", log_file)
 
     # Start evaluation

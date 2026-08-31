@@ -221,7 +221,32 @@ Target moved ... m while gripper was open; discarded ... queued actions and will
 
 注意：该检测使用MuJoCo真实物体位姿，属于“特权仿真信息”。它用于证明“推移后重规划是否有帮助”，不能直接作为真实机器人部署方案。若有效，下一步应换成视觉检测或腕部相机目标跟踪。
 
-### 5.3 20 Hz与50 Hz
+### 5.3 空抓确认与强制重规划
+
+先运行不干预的固定状态对照组：
+
+```bash
+bash experiments/robot/libero/failure_study/run_simulation_study.sh grasp_control
+```
+
+再开启仿真真值抓取确认：
+
+```bash
+bash experiments/robot/libero/failure_study/run_simulation_study.sh grasp_verify
+```
+
+检测器在夹爪从打开切换为闭合时选取距离末端最近的 `bowl`。末端移动至少2 cm后，同时检查：
+
+- robosuite的左右指垫是否都与该物体接触；
+- 物体中心与夹爪抓取点距离是否不超过12 cm；
+- 物体是否至少移动1 cm；
+- 物体相对夹爪的位置漂移是否不超过1.5 cm。
+
+若任一条件不满足，脚本清空当前chunk剩余动作并立即重新推理。`events.jsonl`记录
+`grasp_verified` 或 `empty_grasp_forced_replan`，汇总表新增 `Grasp checks` 与
+`Empty-grasp replans` 两列。以上阈值都是仿真消融参数，应根据首轮事件日志校准，不能直接迁移到真实机器人。
+
+### 5.4 20 Hz与50 Hz
 
 ```bash
 bash experiments/robot/libero/failure_study/run_simulation_study.sh freq20
